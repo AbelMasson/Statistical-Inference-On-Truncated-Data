@@ -1,0 +1,684 @@
+---
+title: "Question Mathias - Weibull Distribution of DBH in Uneven-Aged Forests"
+author: "Amasson"
+date: "2025-09-23"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+## Problem presentation
+
+------------------------------------------------------------------------
+
+My project aims to correct a significant bias in our forest growth simulators. These simulators are competition-driven, meaning a tree's predicted growth depends heavily on its neighbors. The problem starts with our data: to save costs, forest inventories often apply a diameter at breasthight- threshold and only measure trees above a certain size (e.g., 5 or 10 cm diameter at breast hight). When we feed this "censored" data to the model, it sees the smallest measured trees, assumes they have no smaller competitors, and therefore overestimates their growth. My goal is to model the missing small trees to give the simulator a realistic picture of the competition.
+
+This is where I've run into a classic "tale of two systems" problem, where the predictability is completely different depending on the forest structure.
+
+My idea is to train a model based on a number of sample plots were all trees were measured, than artificially remove some trees (by applying a diameter at breastheight threshold at 12cm) and see if I can reconstruct the number of censored trees and their distribution.
+
+System 1: Simple, Even-Aged Forests
+
+Here, our approach was very successful. We used a Random Forest model to predict the parameters of the entire Weibull DBH distribution (k and λ). The model is highly predictable, with an R2\>0.90. No problems here.
+
+System 2: Complex, Uneven-Aged Forests
+
+This is where it gets interesting. The same modeling approach failed completely (negative R2). We then switched to a hybrid method:
+
+1.  First, predict only the number of missing trees due to the DBH-thresholds (N_missing).
+2.  Then, distribute them using an average, empirically-derived Weibull shape that was fitted by using the data from all the plots.
+
+Even with this new approach, the model for Nmissing has very low predictive power (R2≈0.35). This suggests that about 65% of the variance is just stochastic noise that our predictors (even fine-scale ones like light) can't explain.
+
+My main question for you is about our approach for this complex system. Does this hybrid method seem reasonable from a modeling perspective? And more generally, what are your thoughts on tackling systems with such a high degree of inherent randomness? Is the main scientific finding simply to quantify this limit of predictability?
+
+------------------------------------------------------------------------
+
+*Importing useful libraries*
+
+```{r, warning = FALSE, message = FALSE, include = FALSE}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+```
+
+## Method for fitting a complete Weibull distribution based on a truncated empirical distribution of DBH
+
+The method presented here follows the approach of [McGarrigle *et al.* (2011)](https://doi.org/10.1093/forestry/cpr033) and consists in fitting, for each plot, a left-truncated Weibull DBH distribution—that is, the conditional distribution of DBH given that it exceeds a threshold $t$,\
+$$
+f(x \mid x \ge t).
+$$
+
+Overall, [McGarrigle *et al.* (2011)](https://doi.org/10.1093/forestry/cpr033) report that this method performs well. Here, we first develop it using a theoretical example based on simulated data, which allows us to introduce the key steps of model calibration and prediction, along with the metrics used to assess model performance (R², Q-metric, Relative Error, and Kolmogorov–Smirnov tests) and the visualisations produced (DBH distributions and Pearson residual distributions).
+
+We then apply the method to an empirical dataset retrieved from Dryad - [Schwarzmann & Waller (2025)](https://doi.org/10.1016/j.fecs.2025.100347) - which has the simple advantage of providing DBH distributions for multiple forest plots. More precisely, these distributions correspond to multi-species, uneven-aged stands, which we artificially truncate in order to evaluate the robustness of the method.
+
+### Infering parameters of the truncated Weibull DBH distribution
+
+The method developed by [McGarrigle *et al.* (2011)](https://doi.org/10.1093/forestry/cpr033) is based on an empirical observation by [Merganič & Sterba (2006)](https://doi.org/10.1007/s10342-006-0138-2), namely that the parameters of a left-truncated Weibull distribution are very similar to those of the full Weibull distribution. Thus, one can fit the truncated Weibull on the measured portion of the DBH distribution, and then treat the resulting parameters (scale and shape) as equal to those of the full Weibull. In a second step, using the cumulative distribution function of the full Weibull, one can estimate the number of missing small trees and their distribution across the DBH classes.
+
+Starting from the density of a standard Weibull distribution, denoted $f(x)$, and its cumulative distribution function $F(x)$, the density of a left-truncated Weibull distribution for DBH values greater than a threshold $t$ can be written as:
+
+$$
+f(x \mid x > t) = \frac{f(x)}{1 - F(t)}.
+$$
+
+Accordingly, the likelihood associated with $n$ observations of DBH $> t$ under the assumption of a left-truncated Weibull corresponds to the likelihood of a full Weibull multiplied by $1 / (1 - F(t))^{n}$. The resulting log-likelihood (denoted $LL_{W}$ for the complete Weibull and $LL_{TW} (t)$ for the truncated Weibull) is therefore:
+
+$$
+LL_{TW} (t)
+= LL_{W} - n \, \log(1 - F(t)).
+$$
+
+It is then possible to fit the truncated Weibull DBH distribution using maximum likelihood estimation. The following function allows fitting the truncated Weibull DBH distribution:
+
+```{r, echo=FALSE}
+fit_weibull_trunc_mle <- function(dbh_distrib_truncated, t,
+                                  start_shape = 2,
+                                  start_scale = mean(dbh_distrib_truncated, na.rm = TRUE)) {
+  
+  dbh_distrib_truncated <- dbh_distrib_truncated[is.finite(dbh_distrib_truncated)]
+  n <- length(dbh_distrib_truncated)
+  if (n == 0L) stop("Aucun DBH >= t après nettoyage.")
+
+  nll <- function(par) {
+    k   <- par[1]
+    lam <- par[2]
+    if (!is.finite(k) || !is.finite(lam) || k <= 0 || lam <= 0) return(Inf)
+
+    ll1 <- dweibull(dbh_distrib_truncated, shape = k, scale = lam, log = TRUE)
+    p_t <- pweibull(t, shape = k, scale = lam)
+
+    if (any(!is.finite(ll1)) || !is.finite(p_t) || p_t >= 1) return(Inf)
+
+    ll <- sum(ll1) - n * log(1 - p_t)
+    -ll
+  }
+
+  opt <- optim(c(start_shape, start_scale),
+               nll,
+               method = "L-BFGS-B",
+               lower = c(1e-6, 1e-6))
+
+  if (opt$convergence != 0)
+    warning("optim n'a pas convergé (code = ", opt$convergence, ")")
+
+  data.frame(
+    shape       = opt$par[1],
+    scale       = opt$par[2],
+    logLik      = -opt$value
+  )
+}
+```
+
+*Application Example on simulated data :*
+
+Here we simulate a complete Weibull DBH distribution, using parameter values that are broadly consistent with those reported in the literature. We then left-truncate this distribution below DBH = 12 cm and attempt to recover the original parameter values using the calibration function `fit_weibull_trunc_mle()`.
+
+```{r, echo=FALSE}
+dbh_threshold <- 12
+
+dbh_distrib <- rweibull(n=400, shape = 1.9, scale = 30)
+dbh_distrib_truncated <- dbh_distrib[dbh_distrib >= dbh_threshold]
+
+fit <- fit_weibull_trunc_mle(dbh_distrib_truncated, 
+                             t=dbh_threshold, 
+                             start_shape = 2, 
+                             start_scale = mean(dbh_distrib_truncated))
+
+fit
+```
+
+Nothing to celebrate just yet, but the fit provided by the method for the simulated distribution parameters appears accurate and reliable.
+
+### Predicting the number of small (missing) trees based on predicted parameter values
+
+Based on the parameters of the truncated Weibull and the total number of observed trees, one can predict the number of small trees that are missing, denoted $N_{\text{missing}}$. Assuming that the shape of the truncated Weibull is identical to that of the full Weibull [McGarrigle et al. (2011)](https://doi.org/10.1093/forestry/cpr033), we can estimate the probability $P(DBH > t)$ that the DBH of a randomly selected tree in the plot exceeds the threshold $t = 12 \text{ cm}$. This probability is
+
+$$
+P(DBH > t) = 1 - F(t),
+$$
+
+where $F$ is the cumulative distribution function of the Weibull.
+
+The total number of trees in the stand can then be estimated as the number of observed trees divided by this probability. Consequently, the number of missing trees is
+
+$$
+N_{\text{missing}}
+= N_{\text{obs}} \, \frac{1 - P(DBH > t)}{P(DBH > t)}
+= N_{\text{obs}} \, \frac{F(t)}{1 - F(t)}.
+$$
+
+The function `predict_N_missing()` below performs this calculation :
+
+```{r, echo=FALSE}
+predict_N_missing <- function(params, N_obs, t) {
+  k <- params$shape
+  lam <- params$scale
+
+  p_dbh_over_threshold <- 1 - pweibull(t, k, lam)
+  N_tot  <- N_obs / p_dbh_over_threshold
+  N_missing <- N_tot * pweibull(t, k, lam)
+
+  data.frame(
+    N_tot  = N_tot,
+    N_missing = N_missing,
+    p_dbh_over_threshold = p_dbh_over_threshold
+  )
+}
+```
+
+*Application Example on simulated data :*
+
+```{r, echo=FALSE}
+N_obs <- length(dbh_distrib_truncated) # Number of trees observed, that corresponds to the number of trees with DBH over the dbh_threshold
+
+N_missing <- predict_N_missing(params = fit, N_obs = N_obs, t = dbh_threshold)
+N_missing
+```
+
+In our example, the probability that DBH exceeds the threshold $t$ is estimated at 0.85, and the resulting number of missing small trees is estimated at 58. The quality of this prediction is assessed later, in the section on metrics.
+
+Note: The prediction here relies solely on the distribution of trees above the DBH threshold and does not use any environmental predictors (e.g., light availability, as mentioned earlier). It is possible to predict the number of missing trees $N_{\text{missing}}$ using alternative approaches, or to use the value of $N_{\text{missing}}$ predicted by this method as a predictor in another model—including environmental covariates—to obtain an even more accurate prediction.
+
+### Predicting the complete Weibull distribution
+
+We can now distribute the total number of observations $N_{\text{obs}}$ across each DBH class (here using 2-cm classes by default), weighting each class by the difference F(DBH\_{\text{sup}}) - F(DBH\_{\text{inf}}), where $DBH_{\text{sup}}$ and $DBH_{\text{inf}}$ denote the upper and lower bounds of the DBH class.
+
+This is what the function `predict_weibull_full_counts()` below implements:
+
+```{r, echo=FALSE}
+predict_weibull_full_counts <- function(params, N_obs, dbh_classes, t) {
+  
+  k <- params$shape
+  lam <- params$scale
+
+  N   <- predict_N_missing(params, N_obs, t)
+  N_tot <- N$N_tot
+
+  low <- dbh_classes[-length(dbh_classes)]
+  up  <- dbh_classes[-1]
+
+  pred <- N_tot * (pweibull(up, k, lam) - pweibull(low, k, lam))
+
+  data.frame(
+    class_lower = low,
+    class_upper = up,
+    N_pred      = pred,
+    under_t     = up <= t
+  )
+}
+```
+
+*Application Example on simulated data :*
+
+```{r}
+dbh_classes <- seq(0, 200, 2)
+
+pred <- predict_weibull_full_counts(params = fit, N_obs, dbh_classes, t = dbh_threshold)
+head(pred, 10)
+```
+
+This table reports the number of trees (`N_pred`) in each DBH class (defined by its lower and upper bounds, `class_lower` and `class_upper`). The column `under_t` is included simply to facilitate the selection of classes with DBH values below the threshold $t = 12 \text{ cm}$.
+
+### Assessing the quality of the predictions
+
+To assess the overall quality of the fitted Weibull DBH distribution, we calculated an $R^{2}$ using all trees (both above and below the threshold). In addition, because prediction quality depends both on correctly estimating the number of missing trees and on properly allocating these trees among the small DBH classes, we also evaluated these two aspects separately.
+
+**To assess the quality of the prediction of** $N_{\text{missing}}$, we computed the mean relative error (in %) of the prediction compared with the true value. Indeed, $R^{2}$ (in its strict definition) measures the explanatory power of a model relative to a null model (a constant model in which $Y$ equals the mean of the observations). Thus, an $R^{2}$ of 0 means that the model performs no better than the null model—which is undesirable when trying to *explain* $N_{\text{missing}}$, but already quite good when the goal is to *predict* its value. The relative error is likely more appropriate here.
+
+**To evaluate the correctness of the allocation of trees among the small DBH classes**, independently of differences in total tree number, we calculated the predicted and observed proportions of trees in each DBH class (Prop$_{\text{pred}}$ and Prop$_{\text{obs}}$), and then computed Pearson residuals for each class:
+
+$$
+r = \frac{\text{Prop}_{\text{pred}} - \text{Prop}_{\text{obs}}}{\sqrt{\text{Prop}_{\text{obs}}}}.
+$$
+
+We then computed a metric $Q = 1 - \frac{\text{mean}(r_{\text{under}}^{2})}{\text{mean}(r_{\text{over}}^{2})}$ to quantify differences in variability between residuals below and above the threshold. A value of $Q$ around zero indicates no meaningful difference in variability, whereas strongly negative values (approximately $Q < -1$) may indicate a substantial difference.
+
+Finally, we performed a Kolmogorov–Smirnov test comparing the distributions of residuals above and below the threshold. The resulting p-value, denoted $KS_{p}$, indicates whether any difference between the two distributions is statistically significant. As usual, values below $KS_{p} = 0.05$ indicate that the two distributions differ significantly.
+
+```{r, echo=FALSE}
+# PREPROCESS
+# ----------------------------------------------------------------------
+n_obs <- hist(dbh_distrib, breaks = dbh_classes, plot = FALSE)$counts
+n_pred <- pred$N_pred
+
+class_mid <- (pred$class_lower + pred$class_upper) / 2
+
+last_nonzero <- max(which(n_obs > 0))
+idx <- seq_len(last_nonzero)
+
+n_obs <- n_obs[idx] ; n_pred <- n_pred[idx] ; class_mid <- class_mid[idx] ; pred <- pred[idx, ]
+
+# PERASON RESIDUALS
+# ----------------------------------------------------------------------
+get_pearson_residuals <- function(n_obs, n_pred, class_mid, dbh_threshold) {
+  
+  # proportions
+  prop_obs  <- n_obs  / sum(n_obs)
+  prop_pred <- n_pred / sum(n_pred)
+
+  # Pearson residuals
+  eps <- 1e-8
+  pearson_res <- (prop_obs - prop_pred) / sqrt(pmax(prop_pred, eps))
+
+  # Région
+  region <- ifelse(class_mid < dbh_threshold, "DBH < t", "DBH ≥ t")
+
+  # dataframe final
+  data.frame(
+    class_mid   = class_mid,
+    pearson_res = pearson_res,
+    region      = factor(region, levels = c("DBH < t", "DBH ≥ t"))
+  )
+}
+
+# METRICS 
+# ----------------------------------------------------------------------
+r2_global <- function(X_obs, X_pred) {
+  X_mean <- mean(X_obs)
+  1 - sum((X_obs - X_pred)^2) / sum((X_obs - X_mean)^2)
+}
+
+re_missing <- function(N_missing_obs, N_missing_pred) {
+  ((N_missing_pred - N_missing_obs) / N_missing_obs) * 100
+}
+
+Q_metric_from_df <- function(df_res) {
+  r_under <- df_res$pearson_res[df_res$region == "DBH < t"]
+  r_over  <- df_res$pearson_res[df_res$region == "DBH ≥ t"]
+  
+  mse_under <- mean(r_under^2, na.rm = TRUE)
+  mse_over  <- mean(r_over^2,  na.rm = TRUE)
+  
+  if (!is.finite(mse_over) || mse_over <= 0) return(NA_real_)
+  
+  1 - mse_under / mse_over
+}
+
+KS_p_from_df <- function(df_res) {
+  tryCatch(
+    ks.test(
+      abs(df_res$pearson_res[df_res$region == "DBH < t"]),
+      abs(df_res$pearson_res[df_res$region == "DBH ≥ t"])
+    )$p.value,
+    error = function(e) NA_real_
+  )
+}
+```
+
+*Application Example on simulated data :*
+
+```{r, echo=FALSE}
+# Pearson residuals based metrics
+df_res <- get_pearson_residuals(n_obs, n_pred, class_mid, dbh_threshold = dbh_threshold)
+
+# Metrics
+Q <- Q_metric_from_df(df_res)
+R2_all <- r2_global(n_obs, n_pred)
+RE_missing <- re_missing(sum(dbh_distrib < dbh_threshold), sum(pred$N_pred[pred$under_t]))
+KS_p <- KS_p_from_df(df_res)
+
+metrics <- data.frame(
+  Q = Q,
+  R2_all = R2_all,
+  RE_missing = RE_missing,
+  KS_p = KS_p
+)
+
+metrics
+```
+
+The overall $R^{2}$ is 0.91, indicating that, in general, the full Weibull provides a good fit to the data. For the predicted number of missing trees, we obtain an error of +5% relative to the true value, which is reasonably satisfactory.
+
+A value of $Q = 0.9$ indicates that the mean error in the distribution below the threshold is lower than the variance of the distribution above the threshold; however, $KS_{p} = 0.22 > 0.05$ indicates that the residual distributions above and below the threshold are not significantly different.
+
+### Vizualising results
+
+*Vizualization of the observed and predicted distributions*
+
+```{r, echo=FALSE}
+plot_weibull_hist_curve <- function(df, counts, t, metrics) {
+  df$class_mid <- (df$class_lower + df$class_upper) / 2
+  bw <- unique(df$class_upper - df$class_lower)[1]
+  
+  df$N_obs  <- as.numeric(counts)
+  df$N_pred <- as.numeric(df$N_pred)
+
+  ymax <- max(c(df$N_obs, df$N_pred), na.rm = TRUE)
+  xmin <- min(df$class_mid, na.rm = TRUE)
+  xmax <- max(df$class_mid[df$N_obs > 0], na.rm = TRUE)
+
+  ggplot2::ggplot(df, ggplot2::aes(x = class_mid)) +
+    ggplot2::geom_col(
+      ggplot2::aes(y = N_obs, fill = class_upper <= t),
+      width = bw, color = "grey40"
+    ) +
+    ggplot2::scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "grey80")) +
+    ggplot2::geom_line(ggplot2::aes(y = N_pred), linewidth = 1) +
+    ggplot2::geom_vline(xintercept = t, linetype = 2, linewidth = 1, color = "blue") +
+    ggplot2::annotate(
+      "label",
+      x = xmin + 0.70 * (xmax - xmin),
+      y = 0.9 * ymax,
+      label = paste0(
+        "RE N missing = ", sprintf("%.1f", metrics$RE_missing), " %\n",
+        "R² total     = ", sprintf("%.3f", metrics$R2_all), "\n",
+        "Q metric     = ", sprintf("%.3f", metrics$Q)
+      )
+    ) +
+    ggplot2::labs(
+      x = "DBH classes (cm)", y = "Number of trees",
+      title = "DBH distribution: observed (histogram) vs predicted (curve)"
+    ) +
+    ggplot2::coord_cartesian(xlim = c(0, xmax)) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      legend.position = "none",
+      text = ggplot2::element_text(size = 12),
+      plot.margin = grid::unit(rep(10, 4), "pt")
+    )
+}
+```
+
+```{r}
+plot_weibull_hist_curve(pred, n_obs, t = dbh_threshold, metrics)
+```
+
+**Figure 1 – DBH distribution: observed (histogram) and left-truncated Weibull fit (curve).**\
+The histogram shows the observed number of trees in each DBH class, either above (grey) or below (red) the DBH threshold (dashed blue line at 12 cm). The black curve represents the Weibull distribution fitted using only trees above the threshold (all trees in the grey classes). The inset reports the Relative Error (RE N missing) in predicting the number of missing small trees (all trees in the red classes), the overall goodness of fit (R² total), and the Q metric.
+
+The Weibull curve predicted by the model matches the observed (simulated) distribution well. Metrics values and interpretation are the same as above.
+
+*Vizualization of the distribution of residuals*
+
+```{r, echo=FALSE}
+plot_residuals_by_class <- function(df_res, Q, KS_p, t) {
+
+  ymax <- max(df_res$pearson_res, na.rm = TRUE)
+  xmax <- max(df_res$class_mid,   na.rm = TRUE)
+
+  ggplot2::ggplot(df_res, ggplot2::aes(x = class_mid,
+                                       y = pearson_res,
+                                       colour = region)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+    ggplot2::geom_vline(xintercept = t, linetype = 2, linewidth = 1.2, colour = "blue") +
+    ggplot2::geom_point(size = 2) +
+    ggplot2::scale_colour_manual(
+      values = c("DBH < t" = "red", "DBH ≥ t" = "grey40"),
+      name   = NULL
+    ) +
+    ggplot2::annotate(
+      "label",
+      x = 0.9 * xmax,
+      y = 0.9 * ymax,
+      label = paste0(
+        "Q = ", sprintf('%.3f', Q), "\n",
+        "KS p  = ", ifelse(is.na(KS_p), "NA", sprintf('%.3f', KS_p))
+      )
+    ) +
+    ggplot2::labs(
+      x = "DBH class mid (cm)",
+      y = "Pearson residuals",
+      title = "Pearson residuals by DBH class"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(legend.position = "none")
+}
+```
+
+```{r}
+plot_residuals_by_class(df_res, Q, KS_p, t = dbh_threshold)
+```
+
+**Figure 2 – Pearson residuals by DBH class.**\
+Pearson residuals (points) comparing observed and expected proportions for each DBH class, either above (grey) or below (red) the DBH threshold indicated by the dashed blue line. The inset reports the Q metric and the Kolmogorov–Smirnov goodness-of-fit test p-value (KS p).
+
+On the graphic, the residuals below the DBH threshold (in red) do not appear to be overdispersed. This is also what the the p-value of the KS test (Ks p = 0.22) indicates.
+
+## Application to empirical data
+
+### The dataset of Schwarzmann and Waller
+
+We now test our approach on real data to evaluate its robustness across the range of Weibull parameter values observed in actual forest stands, using a dataset from [Schwarzmann & Waller (2025)](https://doi.org/10.1016/j.fecs.2025.100347) with multi-species uneven-aged stands. Although our method assumes that DBH distributions are reasonably well approximated by a unimodal Weibull, this assumption may be violated in such heterogeneous stands. Furthermore, trees under 12 cm DBH appear not to have been measured so we had to truncate the DBH distributions below 20 cm to assess the quality of our method for trees in the 12–20 cm DBH range. This setup is not ideal, but it was difficult to find a more suitable dataset. Nevertheless, the method appears to perform reasonably well on this dataset ...
+
+*Importing the dataset*
+
+```{r}
+df <- read_excel("Tree-DBH-BA_and_BM_Growth-Data-BySps.xlsx", sheet = 1)
+head(df, 10)
+```
+
+*Exploring DBH distribution within the dataset*
+
+```{r}
+# Choosing a PLOT_ID from 1 to XX to Display
+PLOT_ID = 10
+```
+
+```{r, echo=FALSE}
+df_plot <- df[df$PLOT_ID == PLOT_ID, ]
+
+breaks_seq <- seq(10, max(df_plot$DBH, na.rm = TRUE) + 2, by = 2)
+
+ggplot(df_plot, aes(x = DBH)) +
+  geom_histogram(breaks = breaks_seq, fill = "darkseagreen3", color = "black") +
+  labs(
+    title = "DBH Distribution",
+    x = "DBH (cm)",
+    y = "Number of trees"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+It appears that the DBH distribution in this dataset is already truncated at approximately 12 cm. We therefore truncate it further at $t = 20$ cm and then evaluate the quality of our predictions for trees in the 12–20 cm DBH range.
+
+### Fitting a complete Weibull based on a truncated empirical distribution of DBH for each plot
+
+*Example on a single plot*
+
+First we have to choose a plot (a plot ID 'pid'), and a declare dbh_threshold 't \<- 20' to truncate the observations.
+
+```{r, echo = FALSE}
+t   <- 20
+pid <- 10
+
+# Get complete and truncated dbh distributions
+df_plot <- df[df$PLOT_ID == pid, ]
+dbh_distrib <- na.omit(df_plot$DBH)
+dbh_distrib_truncated <- dbh_distrib[dbh_distrib >= t]
+
+# Define DBH classes
+dbh_classes_for <- function(dbh_distrib) {
+  x <- dbh_distrib[is.finite(dbh_distrib)]
+  if (length(x) == 0L) return(NULL)
+  
+  bmin <- floor(min(x) / 2) * 2
+  bmax <- ceiling(max(x) / 2) * 2
+  seq(bmin, bmax, by = 2)
+}
+
+dbh_classes <- dbh_classes_for(dbh_distrib)
+```
+
+Now let's see how the method performs on that example :
+
+```{r, echo = FALSE}
+# FITTING truncated Weibull
+# -----------------------------------------------------------------
+fit <- fit_weibull_trunc_mle(dbh_distrib_truncated, t = t)
+
+# PREDICTING Weibull-based counts for all dbh classes
+# -----------------------------------------------------------------
+pred <- predict_weibull_full_counts(
+  params       = fit,
+  N_obs        = length(dbh_distrib_truncated),   
+  dbh_classes  = dbh_classes,
+  t            = t
+)
+
+n_per_class_obs  <- hist(dbh_distrib, breaks = dbh_classes, plot = FALSE)$counts
+n_per_class_pred <- pred$N_pred
+class_mid <- (pred$class_lower + pred$class_upper) / 2
+
+# ASSESSING quality of the predictions
+# -----------------------------------------------------------------
+# Pearson residuals based metrics
+df_res <- get_pearson_residuals(n_per_class_obs, n_per_class_pred, class_mid, dbh_threshold = t)
+
+# Metrics
+Q <- Q_metric_from_df(df_res)
+R2_all <- r2_global(n_obs, n_pred)
+RE_missing <- re_missing(sum(n_per_class_obs[class_mid < t]), sum(n_per_class_pred[class_mid < t]))
+KS_p <- KS_p_from_df(df_res)
+
+metrics <- data.frame(
+  Q = Q,
+  R2_all = R2_all,
+  RE_missing   = RE_missing,
+  KS_p         = KS_p
+)
+
+# VISUALIZING Results
+# -----------------------------------------------------------------
+plot_weibull_hist_curve(pred, n_per_class_obs, t, metrics)
+```
+
+The overall $R^{2}$ is 0.81, indicating that, in general, the full Weibull provides a good fit to the data. For the predicted number of missing trees, we obtain an error of -11% relative to the true value, which is reasonably satisfactory.
+
+A value of $Q = 0.688$ indicates that the mean error in the distribution below the threshold is lower than the variance of the distribution above the threshold; however, $Q$ remains close to zero, and $KS_{p} = 0.15 > 0.05$ indicates that the residual distributions above and below the threshold are not significantly different (see also the distributions of residuals below).
+
+It looks like it works just as well on this empirical dataset than on the simulated one earlier.
+
+```{r}
+plot_residuals_by_class(df_res, Q, KS_p, t)
+```
+
+*Application on all plots in the dataset*
+
+```{r, echo = FALSE}
+t <- 20
+plot_ids <- sort(unique(df$PLOT_ID))
+
+res_list <- lapply(plot_ids, function(pid) {
+  
+  # PREPROCESSING
+  # ---------------------------------------------------
+  df_plot <- df %>%
+    dplyr::filter(PLOT_ID == pid, is.finite(DBH))
+  
+  dbh_distrib <- df_plot$DBH
+  dbh_classes <- dbh_classes_for(dbh_distrib)
+  
+  dbh_distrib_truncated <- dbh_distrib[dbh_distrib >= t]
+  if (length(dbh_distrib_truncated) < 20) return(NULL)
+  
+  # FITTING
+  # ---------------------------------------------------
+  fit <- fit_weibull_trunc_mle(dbh_distrib_truncated, t = t)
+  
+  # PREDICTING
+  # ---------------------------------------------------
+  pred <- predict_weibull_full_counts(
+    params      = fit,
+    N_obs       = length(dbh_distrib_truncated),  
+    dbh_classes = dbh_classes,
+    t           = t
+  )
+  
+  n_per_class_obs  <- hist(dbh_distrib, breaks = dbh_classes, plot = FALSE)$counts
+  n_per_class_pred <- pred$N_pred
+  class_mid        <- (pred$class_lower + pred$class_upper) / 2
+  
+  # METRICS
+  # ---------------------------------------------------
+  # Résidus de Pearson
+  df_res <- get_pearson_residuals(n_per_class_obs, n_per_class_pred, class_mid, t)
+  
+  Q    <- Q_metric_from_df(df_res)
+  KS_p <- KS_p_from_df(df_res)
+  R2_all <- r2_global(n_per_class_obs, n_per_class_pred)
+  RE_missing  <- re_missing(sum(n_per_class_obs[class_mid < t]), sum(n_per_class_pred[class_mid < t]))
+  
+  # ---- Sortie par parcelle ----
+  data.frame(
+    PLOT_ID      = pid,
+    shape        = fit$shape,
+    scale        = fit$scale,
+    Q            = Q,
+    R2_all = R2_all,
+    RE_missing   = RE_missing,
+    KS_p         = KS_p,
+    N_tot_pred   = sum(n_per_class_pred),
+    N_tot_obs = sum(n_per_class_obs),
+    N_missing_pred = sum(n_per_class_pred[class_mid < t]),
+    N_missing_obs = sum(n_per_class_obs[class_mid < t])
+  )
+})
+
+results <- do.call(rbind, res_list)
+```
+
+```{r}
+head(results, 10)
+```
+
+### Predictive power of the approach
+
+Displaying predicted vs. observed number of tree under the DBH threshold
+
+```{r, echo = FALSE}
+# Adding observations and predictions of N_missing
+df_results <- results |>
+  dplyr::mutate(
+    N_missing       = N_missing_obs,
+    N_missing_pred  = N_missing_pred,
+    RE_missing      = RE_missing,
+    N_tot_obs_plot  = N_tot_obs
+  )
+
+RE_mean <- mean(df_results$RE_missing, na.rm = TRUE)
+
+# Computing R2 of the relationship between N_missing and N_missing_pred
+R2_ <- with(
+  df_results,
+  1 - sum((N_missing - N_missing_pred)^2) /
+      sum((N_missing - mean(N_missing))^2)
+)
+
+# ---- Figure ----
+ggplot2::ggplot(df_results, ggplot2::aes(
+  x = N_missing,
+  y = N_missing_pred,
+  size = N_tot_obs_plot                                 
+)) +
+  ggplot2::geom_point(alpha = 0.6) +                    
+  ggplot2::geom_abline(slope = 1, intercept = 0,
+                       linetype = 2, linewidth = 1.2, color = "red") +
+  ggplot2::annotate(
+    "label",
+    x = max(df_results$N_missing,      na.rm = TRUE) * 0.15,
+    y = max(df_results$N_missing_pred, na.rm = TRUE) * 0.90,
+    label = paste0(
+      "R² = ", sprintf("%.3f", R2_), "\n",
+      "Mean RE = ", sprintf("%.1f", RE_mean), " %"
+    ),
+    size = 5
+  ) +
+  ggplot2::labs(
+    x = paste0("Observed"),
+    y = paste0("Predicted"),
+    size = "Total trees\nin plot",                      
+    title = paste0("N missing : Comparing observed vs. predicted values across plots")
+  ) + 
+  ggplot2::theme_minimal()
+```
+
+**Figure 3 – Comparison between observed and predicted numbers of missing trees across plots**. Each point represents the observed versus predicted counts of missing trees for a given plot. Point size is proportional to the total number of trees in the plot. The red dashed line represents the 1:1 relationship. The inset reports the R² and the mean relative error (Mean RE) across all plots.
+
+The predictions of $N_{\text{missing}}$ are generally satisfactory, although a slight bias is evident: on average, predictions are 28.6% higher than the observed values.
+
+## Conclusion
+
+My impression is that the method yields more satisfactory results than the $R^{2} = 0.35$ mentioned in your email. Of course, I do not know the level of precision you require, and the method can certainly be improved if needed. In particular, the paper by [McGarrigle et al. (2011)](https://doi.org/10.1093/forestry/cpr033) describes an approach that combines the Weibull-based prediction with environmental predictors to obtain even more accurate estimates.
